@@ -8,6 +8,10 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
     CFLAGS += -I/opt/homebrew/include -isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1
     LDFLAGS = -L/opt/homebrew/lib -lrtlsdr -lliquid -lmp3lame -lshout -lm -lpthread
+# FreeBSD specific settings
+else ifeq ($(UNAME_S),FreeBSD)
+    CFLAGS += -I/usr/local/include
+    LDFLAGS = -L/usr/local/lib -lrtlsdr -lliquid -lmp3lame -lshout -lm -lpthread
 else
     # Linux and other systems
     LDFLAGS = -lrtlsdr -lliquid -lmp3lame -lshout -lm -lpthread
