@@ -894,8 +894,8 @@ int main(int argc, char* argv[]) {
     lame_t lame = lame_init();
     lame_set_in_samplerate(lame, g_config.audio_rate);
     lame_set_out_samplerate(lame, g_config.audio_rate);
-    lame_set_num_channels(lame, 1);
-    lame_set_mode(lame, MONO);
+    lame_set_num_channels(lame, 2);
+    lame_set_mode(lame, STEREO);
     lame_set_quality(lame, g_config.mp3_quality);
     lame_set_brate(lame, g_config.mp3_bitrate);
     lame_set_VBR(lame, vbr_off);
@@ -953,7 +953,7 @@ int main(int argc, char* argv[]) {
     std::thread icecast_thread(icecast_thread_function, shout);
 
     // Buffers for processing
-    std::vector<short> pcm_buffer(CHUNK_SIZE);
+    std::vector<short> pcm_buffer(CHUNK_SIZE * 2);
     std::vector<unsigned char> mp3_buffer(MP3_BUFFER_SIZE);
     
     auto last_status_time = std::chrono::steady_clock::now();
@@ -988,21 +988,22 @@ int main(int argc, char* argv[]) {
         }
         
         if (have_chunk) {
-            // Extract chunk and convert to PCM            
+            // Extract chunk and convert to PCM (stereo: duplicate mono to both channels)
             {
                 std::lock_guard<std::mutex> lock(buffer_mutex);
                 for (int i = 0; i < CHUNK_SIZE; i++) {
                     float sample = std::max(-1.0f, std::min(1.0f, audio_buffer.front()));
                     sample *= 0.7f; // Prevent clipping
-                    pcm_buffer[i] = static_cast<short>(sample * 32767.0f);
+                    short sample_short = static_cast<short>(sample * 32767.0f);
+                    pcm_buffer[i*2] = sample_short;       // left channel
+                    pcm_buffer[i*2 + 1] = sample_short;   // right channel
                     audio_buffer.pop_front();
                 }
             }
             
-            // Encode to MP3
-            int mp3_size = lame_encode_buffer(lame,
+            // Encode to MP3 (stereo)
+            int mp3_size = lame_encode_buffer_interleaved(lame,
                                             pcm_buffer.data(),
-                                            nullptr,
                                             CHUNK_SIZE,
                                             mp3_buffer.data(),
                                             mp3_buffer.size());
