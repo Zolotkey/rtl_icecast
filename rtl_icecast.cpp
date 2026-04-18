@@ -953,7 +953,8 @@ int main(int argc, char* argv[]) {
     std::thread icecast_thread(icecast_thread_function, shout);
 
     // Buffers for processing
-    std::vector<short> pcm_buffer(CHUNK_SIZE * 2);
+    std::vector<short> pcm_left(CHUNK_SIZE);
+    std::vector<short> pcm_right(CHUNK_SIZE);
     std::vector<unsigned char> mp3_buffer(MP3_BUFFER_SIZE);
     
     auto last_status_time = std::chrono::steady_clock::now();
@@ -995,15 +996,16 @@ int main(int argc, char* argv[]) {
                     float sample = std::max(-1.0f, std::min(1.0f, audio_buffer.front()));
                     sample *= 0.7f; // Prevent clipping
                     short sample_short = static_cast<short>(sample * 32767.0f);
-                    pcm_buffer[i*2] = sample_short;       // left channel
-                    pcm_buffer[i*2 + 1] = sample_short;   // right channel
+                    pcm_left[i] = sample_short;
+                    pcm_right[i] = sample_short;
                     audio_buffer.pop_front();
                 }
             }
             
             // Encode to MP3 (stereo)
-            int mp3_size = lame_encode_buffer_interleaved(lame,
-                                            pcm_buffer.data(),
+            int mp3_size = lame_encode_buffer(lame,
+                                            pcm_left.data(),
+                                            pcm_right.data(),
                                             CHUNK_SIZE,
                                             mp3_buffer.data(),
                                             mp3_buffer.size());
