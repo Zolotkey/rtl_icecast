@@ -121,6 +121,7 @@ password = your_streamer_password
 user = source
 protocol = http    ; only http is supported for now
 format = mp3
+tls = disabled     ; disabled (default, no libshout !POKE probe) or auto
 reconnect_attempts = 5
 reconnect_delay_ms = 2000 
 
@@ -149,6 +150,7 @@ Adjust the values according to your needs:
   - `narrow` for narrow FM (12.5 kHz deviation, used for amateur radio, etc.)
   - `am` for Amplitude Modulation (AM broadcast, aircraft communications, etc.)
 - `host`, `port`, `mount`, `user`, `password`: Your Icecast server details
+- `tls`: `disabled` (default) prevents libshout from probing the server with `GET /admin/!POKE` during connect. Set to `auto` to restore libshout's default TLS/capability probing. The stream itself is plain HTTP either way.
 
 ## Usage
 
