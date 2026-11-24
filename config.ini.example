@@ -32,6 +32,7 @@ password = your_streamer_password
 user = source
 protocol = http    ; only http is supported for now
 format = mp3
+tls = disabled     ; disabled (default, no libshout !POKE probe) or auto
 reconnect_attempts = 5
 reconnect_delay_ms = 2000 
 

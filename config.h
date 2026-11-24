@@ -57,6 +57,7 @@ struct Config {
     std::string icecast_user;
     std::string icecast_protocol;
     std::string icecast_format;
+    std::string icecast_tls;    // "disabled" (default) or "auto"
     int reconnect_attempts;
     int reconnect_delay_ms;
 
@@ -90,6 +91,7 @@ struct Config {
         icecast_user("source"), // icecast wants "source"
         icecast_protocol("http"),
         icecast_format("mp3"),
+        icecast_tls("disabled"),
         reconnect_attempts(5),
         reconnect_delay_ms(2000),
         icecast_station_title("RTL-SDR Radio")

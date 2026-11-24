@@ -487,6 +487,23 @@ void update_icecast_metadata(shout_t* shout, double freq_mhz, float signal_db) {
     }
 }
 
+// libshout enables TLS auto-detection by default, which makes it probe the
+// server with an extra SOURCE request and GET /admin/!POKE before streaming.
+// Plain HTTP streaming does not need that, so disable it unless explicitly
+// requested in the config.
+static void configure_icecast_tls(shout_t* shout)
+{
+#ifdef SHOUT_TLS_DISABLED
+    const bool autodetect = g_config.icecast_tls == "auto" ||
+                            g_config.icecast_tls == "enabled" ||
+                            g_config.icecast_tls == "true" ||
+                            g_config.icecast_tls == "1";
+    shout_set_tls(shout, autodetect ? SHOUT_TLS_AUTO : SHOUT_TLS_DISABLED);
+#else
+    (void)shout;
+#endif
+}
+
 // Function to reconnect to Icecast
 bool reconnect_icecast(shout_t* &shout) {
     std::cout << "Attempting to reconnect to Icecast...\n";
@@ -517,6 +534,8 @@ bool reconnect_icecast(shout_t* &shout) {
     shout_set_format(shout, SHOUT_FORMAT_MP3);
     
     shout_set_protocol(shout, SHOUT_PROTOCOL_HTTP);
+
+    configure_icecast_tls(shout);
     
     // Set station name using older API call
     shout_set_name(shout, g_config.icecast_station_title.c_str());
@@ -922,6 +941,8 @@ int main(int argc, char* argv[]) {
     shout_set_format(shout, SHOUT_FORMAT_MP3);
     
     shout_set_protocol(shout, SHOUT_PROTOCOL_HTTP);
+
+    configure_icecast_tls(shout);
     
     // Set station name using older API call
     shout_set_name(shout, g_config.icecast_station_title.c_str());

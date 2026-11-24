@@ -195,6 +195,12 @@ Config parse_config(const std::string &filename) {
         if (section.count("format")) {
             config.icecast_format = section["format"];
         }
+
+        if (section.count("tls")) {
+            config.icecast_tls = section["tls"];
+            std::transform(config.icecast_tls.begin(), config.icecast_tls.end(),
+                           config.icecast_tls.begin(), ::tolower);
+        }
         
         if (section.count("station_title")) {
             config.icecast_station_title = section["station_title"];
