@@ -6,14 +6,17 @@
 #include <lame/lame.h>
 #include <shout/shout.h>
 #include <cmath>
+#include <algorithm>
 #include <thread>
 #include <atomic>
 #include <csignal>
+#include <signal.h>
 #include <chrono>
 #include <mutex>
 #include <deque>
 #include <iomanip>
 #include <fcntl.h>
+#include <unistd.h>
 #include "config.h"
 #include "scanner.h"
 
@@ -31,6 +34,10 @@ bool quiet = false;
 
 // Global RTL-SDR device pointer
 rtlsdr_dev_t *g_dev = nullptr;
+
+// The Icecast connection is replaced on every reconnect.  Keep it shared so
+// the streaming thread and main()'s cleanup never use a stale pointer.
+std::atomic<shout_t*> g_shout{nullptr};
 
 Scanner *scanner = nullptr;
 
@@ -94,17 +101,48 @@ StatusInfo current_status;
 std::chrono::steady_clock::time_point last_metadata_update;
 const int METADATA_UPDATE_INTERVAL_SEC = 10; // Update metadata every 10 seconds
 
-void signal_handler(int sig) {
-    if (sig == SIGPIPE) {
-        std::cerr << "Caught SIGPIPE - connection broken\n";
-        icecast_connected = false;  // Mark connection as broken
-    } else if (sig == SIGINT) {
-        std::cout << "Caught SIGINT - shutting down\n";
-        running = false;
-    } else {
-        std::cerr << "Caught signal " << sig << "\n";
-        running = false;
+// Sleep in short slices so a shutdown request is noticed quickly instead of
+// waiting out a long reconnect/backoff timer.
+static void sleep_while_running(std::chrono::milliseconds duration) {
+    const auto slice = std::chrono::milliseconds(100);
+    while (running && duration.count() > 0) {
+        const auto step = (duration < slice) ? duration : slice;
+        std::this_thread::sleep_for(step);
+        duration -= step;
     }
+}
+
+// Signal handlers must only do async-signal-safe work.  In particular, never
+// use iostreams here: printing can deadlock if the signal interrupts a thread
+// that already holds the stream's internal lock.
+void signal_handler(int sig) {
+    switch (sig) {
+        case SIGPIPE: {
+            static const char msg[] = "Caught SIGPIPE - connection broken\n";
+            (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+            icecast_connected = false;  // Mark connection as broken
+            return;
+        }
+        case SIGINT: {
+            static const char msg[] = "\nCaught SIGINT - shutting down\n";
+            (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+            break;
+        }
+        case SIGTERM: {
+            static const char msg[] = "\nCaught SIGTERM - shutting down\n";
+            (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+            break;
+        }
+        default: {
+            static const char msg[] = "\nCaught signal - shutting down\n";
+            (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+            break;
+        }
+    }
+
+    // std::atomic<bool> is lock-free on all platforms this project targets,
+    // so writing it from a signal handler is safe.
+    running = false;
 }
 
 // Advanced FM demodulator with phase unwrapping, DC blocking and de-emphasis
@@ -504,77 +542,89 @@ static void configure_icecast_tls(shout_t* shout)
 #endif
 }
 
-// Function to reconnect to Icecast
-bool reconnect_icecast(shout_t* &shout) {
+// Function to reconnect to Icecast.  The shared pointer is replaced here so
+// that main()'s cleanup always frees the currently live connection.
+bool reconnect_icecast() {
     std::cout << "Attempting to reconnect to Icecast...\n";
-    
+
     // Close existing connection if any
-    if (shout) {
-        shout_close(shout);
-        shout_free(shout);
-        shout = nullptr;  // Ensure pointer is nullified
+    shout_t* old_shout = g_shout.exchange(nullptr);
+    if (old_shout) {
+        shout_close(old_shout);
+        shout_free(old_shout);
     }
-    
+
     // Create new connection
-    shout = shout_new();
+    shout_t* shout = shout_new();
     if (!shout) {
         std::cerr << "Failed to create new shout instance\n";
         icecast_connected = false;
         return false;
     }
-    
+
     // Configure connection
     shout_set_host(shout, g_config.icecast_host.c_str());
     shout_set_port(shout, g_config.icecast_port);
     shout_set_mount(shout, g_config.icecast_mount.c_str());
     shout_set_user(shout, g_config.icecast_user.c_str());
     shout_set_password(shout, g_config.icecast_password.c_str());
-    
+
     // Use older API calls for better compatibility
     shout_set_format(shout, SHOUT_FORMAT_MP3);
-    
+
     shout_set_protocol(shout, SHOUT_PROTOCOL_HTTP);
 
     configure_icecast_tls(shout);
-    
+
     // Set station name using older API call
     shout_set_name(shout, g_config.icecast_station_title.c_str());
-    
+
     // Use blocking mode for initial connection
     shout_set_nonblocking(shout, 0);
-    
-    printf("Connecting to Icecast server %s:%d%s...\n", 
+
+    printf("Connecting to Icecast server %s:%d%s...\n",
            g_config.icecast_host.c_str(), g_config.icecast_port, g_config.icecast_mount.c_str());
-    
+
     int err = shout_open(shout);
     if (err == SHOUTERR_SUCCESS) {
+        g_shout.store(shout);
         std::cout << "Successfully connected to Icecast\n";
         icecast_connected = true;
-        
+
         // Set initial metadata
         uint32_t current_freq = rtlsdr_get_center_freq(g_dev);
         float current_freq_mhz = current_freq / 1e6;
         update_icecast_metadata(shout, current_freq_mhz, signal_strength.load());
         last_metadata_update = std::chrono::steady_clock::now();
-        
+
         return true;
     }
-    
+
     std::cerr << "Failed to connect to Icecast: " << shout_get_error(shout) << std::endl;
+    shout_close(shout);
+    shout_free(shout);
     icecast_connected = false;
     return false;
 }
 
 // Thread function for Icecast streaming
-void icecast_thread_function(shout_t* shout) {
+void icecast_thread_function() {
     printf("Starting Icecast streaming thread\n");
-    
+
     int consecutive_errors = 0;
     const std::chrono::milliseconds reconnect_delay(g_config.reconnect_delay_ms);
     auto last_connection_check = std::chrono::steady_clock::now();
     last_metadata_update = std::chrono::steady_clock::now();
-    
+
     while (running) {
+        // reconnect_icecast() may have replaced (or temporarily removed) the
+        // connection since the last iteration, so always fetch the current
+        // one and treat a missing handle as disconnected.
+        shout_t* shout = g_shout.load();
+        if (!shout) {
+            icecast_connected = false;
+        }
+
         // Periodically check connection status (every 5 seconds)
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::seconds>(now - last_connection_check).count() >= 5) {
@@ -584,11 +634,11 @@ void icecast_thread_function(shout_t* shout) {
             }
             last_connection_check = now;
         }
-        
+
         // Check if it's time to update metadata (every METADATA_UPDATE_INTERVAL_SEC seconds)
-        if (icecast_connected.load() && 
+        if (icecast_connected.load() &&
             std::chrono::duration_cast<std::chrono::seconds>(now - last_metadata_update).count() >= METADATA_UPDATE_INTERVAL_SEC) {
-            
+
             if (g_dev) {
                 uint32_t current_freq = rtlsdr_get_center_freq(g_dev);
                 float current_freq_mhz = current_freq / 1e6;
@@ -596,34 +646,37 @@ void icecast_thread_function(shout_t* shout) {
             }
             last_metadata_update = now;
         }
-        
+
         // Check connection status
         if (!icecast_connected) {
+            if (!running) break;
             std::cout << "Not connected to Icecast, attempting to reconnect...\n";
-            
+
             if (consecutive_errors < g_config.reconnect_attempts) {
-                if (reconnect_icecast(shout)) {
+                if (reconnect_icecast()) {
                     consecutive_errors = 0;
                 } else {
                     consecutive_errors++;
-                    std::cout << "Reconnection attempt " << consecutive_errors 
+                    std::cout << "Reconnection attempt " << consecutive_errors
                               << " of " << g_config.reconnect_attempts << " failed\n";
-                    std::this_thread::sleep_for(reconnect_delay);
+                    sleep_while_running(reconnect_delay);
                     continue;
                 }
             } else {
-                std::cerr << "Failed to reconnect after " << g_config.reconnect_attempts 
+                std::cerr << "Failed to reconnect after " << g_config.reconnect_attempts
                          << " attempts, waiting longer...\n";
-                std::this_thread::sleep_for(std::chrono::seconds(30));
+                sleep_while_running(std::chrono::seconds(30));
                 consecutive_errors = 0;
                 continue;
             }
+            // A new connection object is now live; reload it on the next pass.
+            continue;
         }
-        
+
         // Process MP3 data if connected
         MP3Chunk chunk;
         bool have_data = false;
-        
+
         // Get MP3 data from queue
         {
             std::lock_guard<std::mutex> lock(mp3_buffer_mutex);
@@ -633,8 +686,10 @@ void icecast_thread_function(shout_t* shout) {
                 have_data = true;
             }
         }
-        
+
         if (have_data) {
+            if (!running) break;
+
             // Verify connection before sending
             if (!check_icecast_connection(shout)) {
                 // Put the chunk back in the queue if there's space
@@ -644,21 +699,25 @@ void icecast_thread_function(shout_t* shout) {
                 }
                 continue;
             }
-            
+
             // Send data
             last_packet_size.store(0);
             int ret = shout_send(shout, chunk.data.data(), chunk.size);
             last_packet_size.store(chunk.size);
-            
+
             if (ret == SHOUTERR_SUCCESS) {
                 consecutive_errors = 0;
-                // Wait until it's time to send the next chunk
-                shout_sync(shout);
+                // Keep libshout's pacing, but do the waiting ourselves so a
+                // shutdown request does not get stuck in shout_sync().
+                const int delay_ms = shout_delay(shout);
+                if (delay_ms > 0) {
+                    sleep_while_running(std::chrono::milliseconds(delay_ms));
+                }
             } else {
                 std::cerr << "Icecast error: " << shout_get_error(shout) << std::endl;
                 icecast_connected = false;
                 consecutive_errors++;
-                
+
                 // Put the chunk back in the queue if there's space
                 std::lock_guard<std::mutex> lock(mp3_buffer_mutex);
                 if (mp3_queue.size() < MAX_MP3_QUEUE_SIZE) {
@@ -667,10 +726,10 @@ void icecast_thread_function(shout_t* shout) {
             }
         } else {
             // No data available, wait a bit
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            sleep_while_running(std::chrono::milliseconds(10));
         }
     }
-    
+
     printf("Icecast streaming thread ending\n");
 }
 
@@ -851,9 +910,18 @@ int main(int argc, char* argv[]) {
     // Initialize squelch state
     last_signal_above_threshold = std::chrono::steady_clock::now();
     
-    // Set up signal handlers
-    signal(SIGINT, signal_handler);
-    signal(SIGPIPE, signal_handler);
+    // Set up signal handlers.  sigaction() gives consistent behaviour across
+    // platforms; do not set SA_RESTART so blocking calls can be interrupted
+    // when a shutdown is requested.
+    struct sigaction sa;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sa.sa_handler = signal_handler;
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGHUP,  &sa, nullptr);
+    sigaction(SIGQUIT, &sa, nullptr);
+    sigaction(SIGPIPE, &sa, nullptr);
     
     last_stats_time = std::chrono::steady_clock::now();
     
@@ -930,6 +998,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Could not allocate shout_t\n";
         return 1;
     }
+    g_shout.store(shout);
 
     shout_set_host(shout, g_config.icecast_host.c_str());
     shout_set_port(shout, g_config.icecast_port);
@@ -971,7 +1040,7 @@ int main(int argc, char* argv[]) {
     std::thread rtl_thread(rtl_thread_function, g_dev);
     
     // Start Icecast streaming thread
-    std::thread icecast_thread(icecast_thread_function, shout);
+    std::thread icecast_thread(icecast_thread_function);
 
     // Buffers for processing
     std::vector<short> pcm_left(CHUNK_SIZE);
@@ -980,17 +1049,25 @@ int main(int argc, char* argv[]) {
     
     auto last_status_time = std::chrono::steady_clock::now();
     
-    // pre-buffer
+    // pre-buffer.  The lock must be released between checks: holding it in a
+    // tight loop can starve rtl_callback(), and ignoring `running` here used
+    // to make Ctrl-C hang forever before streaming even started.
     printf("Pre-buffering...\n");
-    while (true) {
-        std::lock_guard<std::mutex> lock(buffer_mutex);
-        if (audio_buffer.size() >= CHUNK_SIZE*2) {
-            break; // We have enough samples, exit the loop
+    while (running) {
+        {
+            std::lock_guard<std::mutex> lock(buffer_mutex);
+            if (audio_buffer.size() >= CHUNK_SIZE*2) {
+                break; // We have enough samples, exit the loop
+            }
         }
-        // Optionally, you can add a small sleep to avoid busy waiting        
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    
-    printf("All ready - Let's go!\n");
+
+    if (!running) {
+        printf("Pre-buffering interrupted - shutting down\n");
+    } else {
+        printf("All ready - Let's go!\n");
+    }
     
     while (running) 
     {
@@ -1057,6 +1134,7 @@ int main(int argc, char* argv[]) {
     }
     
     // Cleanup
+    icecast_connected = false;
     rtlsdr_cancel_async(g_dev);  // Stop async reading
     if (rtl_thread.joinable()) {
         rtl_thread.join();
@@ -1066,18 +1144,23 @@ int main(int argc, char* argv[]) {
     }
     msresamp_rrrf_destroy(resampler);
     iirfilt_crcf_destroy(filter);  // Clean up filter
-    
+
     // Clean up low-cut filter
     if (lowcut_filter) {
         iirfilt_rrrf_destroy(lowcut_filter);
     }
-    
+
     delete scanner;
     rtlsdr_close(g_dev);
     lame_close(lame);
-    shout_close(shout);
-    shout_free(shout);
+
+    // The streaming thread may have replaced the connection on reconnect.
+    shout_t* shout_to_close = g_shout.exchange(nullptr);
+    if (shout_to_close) {
+        shout_close(shout_to_close);
+        shout_free(shout_to_close);
+    }
     shout_shutdown();
-    
+
     return 0;
 }
