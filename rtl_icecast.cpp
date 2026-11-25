@@ -58,6 +58,7 @@ iirfilt_rrrf lowcut_filter = nullptr;  // Low-cut filter
 
 #define WFM_DEVIATION 75000   // 75 kHz for WBFM
 #define WFM_FILTER_BW 120000  // 120 kHz for WFM
+#define MAX_FILTER_FRACTION 0.4f  // cutoff <= 80% of Nyquist (liquid uses fc = f/fs)
 
 #define AM_FILTER_BW  8000    // 8 kHz for AM
 
@@ -186,7 +187,7 @@ public:
         deemph_alpha = 1.0f - expf(-1.0f / (time_constant * sample_rate));
         
         // Use de-emphasis only for wide FM
-        use_deemphasis = (mode == ModulationMode::NFM_MODE);
+        use_deemphasis = (mode == ModulationMode::WFM_MODE);
 
     }
     
@@ -252,7 +253,14 @@ void init_modulation(ModulationMode mode) {
     else if (mode == ModulationMode::NFM_MODE) cutoff_freq = NFM_FILTER_BW;
     else cutoff_freq = AM_FILTER_BW;
 
+    // liquid-dsp requires fc < 0.5; leave transition room below Nyquist so
+    // low dongle sample rates don't produce an invalid or unstable filter.
+    cutoff_freq = std::min(cutoff_freq, MAX_FILTER_FRACTION * (float)g_config.sample_rate);
     float filter_bw = cutoff_freq / (float)g_config.sample_rate;
+    // A 200 kHz-spaced adjacent broadcast is only ~22 dB down with a 5th-order
+    // Butterworth at 120 kHz. Use a sharper filter for WFM so neighbors don't
+    // bleed through; NFM/AM keep the lighter filter.
+    unsigned int filter_order = (mode == ModulationMode::WFM_MODE) ? 11 : 5;
     
     if (filter) {
         iirfilt_crcf_destroy(filter);
@@ -262,7 +270,7 @@ void init_modulation(ModulationMode mode) {
         LIQUID_IIRDES_BUTTER,
         LIQUID_IIRDES_LOWPASS,
         LIQUID_IIRDES_SOS,
-        5,
+        filter_order,
         filter_bw,
         0.0f,
         1.0f,
